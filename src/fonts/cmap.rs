@@ -596,8 +596,8 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
             BfSectionKind::Range => {
                 // Format: <srcCodeLo> <srcCodeHi> [<dstString0> <dstString1> ... <dstStringN>]
                 //     or: <srcCodeLo> <srcCodeHi> <dstString>
-                for line in section.lines() {
-                    if let Some(mappings) = parse_bfrange_line(line) {
+                for entry in range_entries(section) {
+                    if let Some(mappings) = parse_bfrange_line(entry) {
                         log::trace!("ToUnicode bfrange: {} mappings parsed", mappings.len());
                         for (src, dst) in mappings {
                             cmap.insert(src, dst);
@@ -612,8 +612,8 @@ pub fn parse_tounicode_cmap(data: &[u8]) -> Result<CMap> {
     // Format: <srcCodeLo> <srcCodeHi> <dstString>
     // Maps a range of codes to a single Unicode character (fallback for unmapped codes)
     for section in extract_sections(&content, "beginnotdefrange", "endnotdefrange") {
-        for line in section.lines() {
-            if let Some(mappings) = parse_notdefrange_line(line) {
+        for entry in range_entries(section) {
+            if let Some(mappings) = parse_notdefrange_line(entry) {
                 log::trace!("ToUnicode notdefrange: {} mappings parsed", mappings.len());
                 for (src, dst) in mappings {
                     // Only insert if not already mapped (normal mappings take precedence)
@@ -704,7 +704,7 @@ fn parse_wmode_directive(content: &str) -> Option<u8> {
     // intact so any subsequent legitimate `/WMode` on a later line is
     // still matched.
     let cleaned: String = content
-        .lines()
+        .split(['\r', '\n'])
         .map(|line| match line.find('%') {
             Some(idx) => &line[..idx],
             None => line,
@@ -836,6 +836,18 @@ fn parse_bfchar_line(line: &str) -> Vec<(u32, String)> {
     }
 
     results
+}
+
+/// Each `<lo> <hi> <dst>` or `<lo> <hi> [<dst> ...]` entry of a bfrange or
+/// notdefrange section, wherever the line breaks fall. Entries are
+/// whitespace-separated tokens (ISO 32000-1:2008 §9.10.3), so one line may hold
+/// several, and a producer may end lines with a bare CR, which `str::lines`
+/// does not split on.
+fn range_entries(section: &str) -> impl Iterator<Item = &str> {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"<[^>]*>\s*<[^>]*>\s*(?:\[(?:\s*<[^>]*>\s*)*\]|<[^>]*>)").unwrap()
+    });
+    RE.find_iter(section).map(|m| m.as_str())
 }
 
 /// Parse a bfrange line: `<start> <end> <dst>`
@@ -1112,6 +1124,31 @@ mod tests {
         let data = b"beginbfchar\n<00E9> <00E9>\nendbfchar"; // é
         let cmap = parse_tounicode_cmap(data).unwrap();
         assert_eq!(cmap.get(&0xE9).as_deref(), Some("é"));
+    }
+
+    #[test]
+    fn test_bfrange_entries_on_cr_only_lines() {
+        // Amyuni PDF Converter writes CMaps with bare CR line endings.
+        let data = b"beginbfrange\r<21> <21> <0048>\r<22> <22> <0049>\rendbfrange";
+        let cmap = parse_tounicode_cmap(data).unwrap();
+        assert_eq!(cmap.get(&0x21).as_deref(), Some("H"));
+        assert_eq!(cmap.get(&0x22).as_deref(), Some("I"));
+    }
+
+    #[test]
+    fn test_bfrange_several_entries_on_one_line() {
+        let data = b"beginbfrange\n<21> <21> <0048> <22> <23> [<0049> <004A>]\nendbfrange";
+        let cmap = parse_tounicode_cmap(data).unwrap();
+        assert_eq!(cmap.get(&0x21).as_deref(), Some("H"));
+        assert_eq!(cmap.get(&0x22).as_deref(), Some("I"));
+        assert_eq!(cmap.get(&0x23).as_deref(), Some("J"));
+    }
+
+    #[test]
+    fn test_notdefrange_entries_on_cr_only_lines() {
+        let data = b"beginnotdefrange\r<01> <01> <0041>\r<02> <02> <0042>\rendnotdefrange";
+        let cmap = parse_tounicode_cmap(data).unwrap();
+        assert_eq!(cmap.get(&0x02).as_deref(), Some("B"));
     }
 
     #[test]
